@@ -78,3 +78,7 @@ Local work is measured with per-thread CPU time. Remote command work is clocked 
 ## License
 
 Licensed under the [Apache License 2.0](./LICENSE).
+
+## Parallel, resumable Expand
+
+`Expand` runs on a parallel, checkpointed engine (`services/parallel_expansion.py`): row-local recipes run per `raw_id` chunk on several PostgreSQL sessions, and an interrupted expansion resumes from the last committed chunk when it is started again. See [PARALLEL_EXPANSION.md](PARALLEL_EXPANSION.md) for the design, guarantees, benchmark results and the Docker-based benchmark in `benchmark/`. Set `PDM_EXPANSION_WORKERS=1` to use the original single-transaction engine.

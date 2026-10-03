@@ -212,12 +212,17 @@ class ParallelExpansionMixin:
         return None
 
     @staticmethod
-    def _tracked_insert_sql(statement: str, destination_name: str, run_id: int, chunk_no=None) -> str:
+    def _tracked_insert_sql(statement: str, destination_name: str, run_id: int, chunk_no=None,
+                            foreign_keys=None) -> str:
         """Run one recipe statement and accumulate its row count and server time.
 
-        Global statements are tracked on the run row, chunk statements on their
-        chunk row. Neither touches pgdm_table_row_counts, so concurrent chunks
-        never wait on the shared counter rows while they insert.
+        Global statements are tracked in pgdm_expansion_globals, chunk
+        statements on their chunk row. Neither touches pgdm_table_row_counts, so
+        concurrent chunks never wait on the shared counter rows while they insert.
+
+        With foreign_keys (bulk FK mode) the INSERT returns its FK columns and
+        every constraint is checked once for the whole statement, replacing the
+        per-row RI triggers that the chunk transaction has switched off.
         """
         tag = _dollar_tag("pgdm_tracked_insert", statement)
         key = sql_literal(destination_name)
@@ -241,13 +246,48 @@ class ParallelExpansionMixin:
 DO {tag}
 DECLARE
     pgdm_rows bigint;
+    pgdm_violations bigint[];
     pgdm_started_at timestamptz := clock_timestamp();
 BEGIN
-    {statement}
-    ;
-    GET DIAGNOSTICS pgdm_rows = ROW_COUNT;{track_sql}
+    {ParallelExpansionMixin._checked_insert_body(statement, foreign_keys)}{track_sql}
 END
 {tag};""".strip()
+
+    @staticmethod
+    def _checked_insert_body(statement: str, foreign_keys) -> str:
+        if not foreign_keys:
+            return f"""{statement}
+    ;
+    GET DIAGNOSTICS pgdm_rows = ROW_COUNT;"""
+        columns = []
+        for fk in foreign_keys:
+            for column in fk["child_cols"]:
+                if column not in columns:
+                    columns.append(column)
+        violations = []
+        for fk in foreign_keys:
+            not_null = " AND ".join(f"i.{sql_ident(c)} IS NOT NULL" for c in fk["child_cols"])
+            matches = " AND ".join(
+                f"p.{sql_ident(pc)} = i.{sql_ident(cc)}" for cc, pc in zip(fk["child_cols"], fk["parent_cols"])
+            )
+            parent = f"{sql_ident(fk['parent_schema'])}.{sql_ident(fk['parent_table'])}"
+            violations.append(
+                f"count(*) FILTER (WHERE {not_null} AND NOT EXISTS ("
+                f"SELECT 1 FROM ONLY {parent} AS p WHERE {matches}))"
+            )
+        names = ", ".join(fk["name"] for fk in foreign_keys)
+        return f"""WITH pgdm_inserted AS (
+    {statement}
+    RETURNING {", ".join(sql_ident(c) for c in columns)}
+    )
+    SELECT count(*), ARRAY[{", ".join(violations)}]
+    INTO pgdm_rows, pgdm_violations
+    FROM pgdm_inserted AS i;
+    IF EXISTS (SELECT 1 FROM unnest(pgdm_violations) AS v WHERE v > 0) THEN
+        RAISE EXCEPTION 'foreign key violation in bulk check (constraints %, violating rows per constraint %)',
+            {sql_literal(names)}, pgdm_violations
+            USING ERRCODE = 'foreign_key_violation';
+    END IF;"""
 
     @staticmethod
     def _apply_counters_sql(rows_source_sql: str, destinations) -> str:
@@ -430,7 +470,7 @@ COMMIT;""",
             cancel_event=cancel_event,
         )
 
-    def _chunk_sql(self, run_id, chunk, chunk_destinations, raw_schemas) -> str:
+    def _chunk_sql(self, run_id, chunk, chunk_destinations, raw_schemas, bulk_fk=None) -> str:
         chunk_no = int(chunk["chunk_no"])
         where = f"run_id = {int(run_id)} AND chunk_no = {chunk_no}"
         statements = [
@@ -439,14 +479,29 @@ COMMIT;""",
                 destination["table_name"],
                 run_id,
                 chunk_no,
+                foreign_keys=(bulk_fk or {}).get("foreign_keys", {}).get(destination["table_name"]) if bulk_fk else None,
             )
             for destination in chunk_destinations
             for statement in destination["statements"]
         ]
+        bulk_fk_sql = []
+        if bulk_fk:
+            bulk_fk_sql = [
+                # RI triggers off for this transaction only; each INSERT checks
+                # its constraints in bulk instead (see _checked_insert_body).
+                "SET LOCAL session_replication_role = replica;",
+            ]
+            if bulk_fk["share_lock_parents"]:
+                # Parents that chunks never write must not change under the
+                # bulk checks; SHARE is compatible across concurrent chunks.
+                bulk_fk_sql.append(
+                    "LOCK TABLE " + ", ".join(bulk_fk["share_lock_parents"]) + " IN SHARE MODE;"
+                )
         return "\n\n".join(
             [
                 "BEGIN;",
                 "SET LOCAL client_min_messages = warning;",
+                *bulk_fk_sql,
                 # Claiming the chunk row first serialises duplicate attempts
                 # (for example a worker left over from a dropped SSH session):
                 # the second one waits, then finds the chunk no longer pending.
@@ -463,7 +518,7 @@ END $pgdm_claim$;""",
         )
 
     def _run_chunk_expansion_phase(self, database_name, run_id, chunk_destinations, raw_schemas, workers,
-                                   cancel_event, progress_callback):
+                                   cancel_event, progress_callback, bulk_fk=None):
         chunks = self._run_expansion_json(
             database_name,
             f"""
@@ -509,7 +564,7 @@ FROM {CHUNKS_TABLE} WHERE run_id = {int(run_id)} AND status <> 'done';""",
                 try:
                     session._run_expansion_psql(
                         database_name,
-                        self._chunk_sql(run_id, chunk, chunk_destinations, raw_schemas),
+                        self._chunk_sql(run_id, chunk, chunk_destinations, raw_schemas, bulk_fk),
                         cancel_event=cancel_event,
                     )
                 finally:
@@ -622,6 +677,80 @@ SELECT json_build_object(
             cancel_event=cancel_event,
         )
 
+    # ---------------------------------------------------------- bulk FK mode
+    def _plan_bulk_fk(self, database_name, prepared, chunk_destinations, cancel_event=None):
+        """Decide whether chunks may swap per-row RI triggers for bulk checks.
+
+        Opt-in (PDM_EXPANSION_BULK_FK=1). Returns (plan, None) or (None, reason).
+        session_replication_role needs a superuser, and it would also silence
+        user triggers, so the mode is refused when any exist on the tables the
+        chunks write.
+        """
+        if os.getenv("PDM_EXPANSION_BULK_FK", "").strip().lower() not in {"1", "true", "yes"}:
+            return None, None
+        tables = [(d["schema_name"], d["pure_table_name"]) for d in chunk_destinations]
+        regclasses = ", ".join(
+            sql_literal(f"{sql_ident(schema)}.{sql_ident(table)}") + "::regclass" for schema, table in tables
+        )
+        info = self._run_expansion_json(
+            database_name,
+            f"""
+SELECT json_build_object(
+    'superuser', (SELECT rolsuper FROM pg_roles WHERE rolname = current_user),
+    'user_triggers', (SELECT count(*) FROM pg_trigger
+                      WHERE NOT tgisinternal
+                        AND tgrelid = ANY(ARRAY[{regclasses}, 'public.pgdm_table_row_counts'::regclass])),
+    'foreign_keys', COALESCE((
+        SELECT json_agg(json_build_object(
+            'name', c.conname,
+            'child_schema', cn.nspname, 'child_table', cc.relname,
+            'parent_schema', pn.nspname, 'parent_table', pc.relname,
+            'match', c.confmatchtype,
+            'child_cols', (SELECT json_agg(a.attname ORDER BY k.ord)
+                           FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                           JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum),
+            'parent_cols', (SELECT json_agg(a.attname ORDER BY k.ord)
+                            FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+                            JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum)
+        ) ORDER BY c.conname)
+        FROM pg_constraint c
+        JOIN pg_class cc ON cc.oid = c.conrelid JOIN pg_namespace cn ON cn.oid = cc.relnamespace
+        JOIN pg_class pc ON pc.oid = c.confrelid JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+        WHERE c.contype = 'f' AND c.conrelid = ANY(ARRAY[{regclasses}])
+    ), '[]'::json)
+)::text;""",
+            cancel_event=cancel_event,
+        )
+        if not info.get("superuser"):
+            return None, "bulk FK mode needs a superuser role (session_replication_role); using per-row checks"
+        if info.get("user_triggers"):
+            return None, "bulk FK mode refused: user triggers exist on the chunk destinations"
+        if any("returning" in {v for k, v, _d in self._tokenize_managed_sql(st) if k == "word"}
+               for d in chunk_destinations for st in d["statements"]):
+            return None, "bulk FK mode refused: a recipe already uses RETURNING"
+        chunk_tables = set(tables)
+        source = (prepared["source_schema_name"], prepared["source_table_name"])
+        foreign_keys = {}
+        share_lock_parents = set()
+        for fk in info["foreign_keys"]:
+            child = (fk["child_schema"], fk["child_table"])
+            parent = (fk["parent_schema"], fk["parent_table"])
+            if fk["match"] != "s":
+                return None, f"bulk FK mode refused: {fk['name']} is not MATCH SIMPLE"
+            if parent == child:
+                return None, f"bulk FK mode refused: {fk['name']} is self-referencing"
+            full_child = next(d["table_name"] for d in chunk_destinations
+                              if (d["schema_name"], d["pure_table_name"]) == child)
+            foreign_keys.setdefault(full_child, []).append(fk)
+            if parent not in chunk_tables:
+                share_lock_parents.add(f"{sql_ident(parent[0])}.{sql_ident(parent[1])}")
+        if source in chunk_tables:
+            return None, "bulk FK mode refused: the source is also a destination"
+        return {
+            "foreign_keys": foreign_keys,
+            "share_lock_parents": sorted(share_lock_parents),
+        }, None
+
     # -------------------------------------------------------------- entry point
     def _try_execute_parallel_cross_table_expansion(
         self, database_name, prepared, source_columns, source_versions,
@@ -658,14 +787,21 @@ SELECT json_build_object(
                     time.perf_counter() - started_at, "client_wall",
                 )
             started_at = time.perf_counter()
+            bulk_fk, bulk_fk_note = self._plan_bulk_fk(
+                database_name, prepared, chunk_destinations, cancel_event=cancel_event
+            )
+            if bulk_fk_note:
+                self._notify_progress(progress_callback, "execute", 8, bulk_fk_note)
             chunks_run = self._run_chunk_expansion_phase(
                 database_name, run["run_id"], chunk_destinations, prepared["raw_schemas"],
-                workers, cancel_event, progress_callback,
+                workers, cancel_event, progress_callback, bulk_fk=bulk_fk,
             )
             self._append_expansion_timing(
                 timing_report, "execute",
-                f"Row-local recipes in {chunks_run} chunk(s) on {workers} parallel session(s)",
+                f"Row-local recipes in {chunks_run} chunk(s) on {workers} parallel session(s)"
+                + (" with bulk FK validation" if bulk_fk else ""),
                 time.perf_counter() - started_at, "client_wall",
+                details=bulk_fk_note,
             )
             started_at = time.perf_counter()
             totals = self._finalize_parallel_expansion(database_name, prepared, run, cancel_event)

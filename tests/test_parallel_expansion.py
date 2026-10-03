@@ -1,5 +1,7 @@
+import os
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from services.postgres_service import PostgresAdminService
 
@@ -105,6 +107,60 @@ class ParallelExpansionPlanTests(unittest.TestCase):
             PostgresAdminService._expansion_run_key("db", first),
             PostgresAdminService._expansion_run_key("db", prepare(challenge_destinations())),
         )
+
+
+TABLE6_FKS = [
+    {
+        "name": "table6_id_column_2_fkey", "match": "s",
+        "child_schema": "public", "child_table": "table6", "child_cols": ["id_column_2"],
+        "parent_schema": "public", "parent_table": "table1", "parent_cols": ["id_column_1"],
+    },
+    {
+        "name": "table6_id_column_3_fkey", "match": "s",
+        "child_schema": "public", "child_table": "table6", "child_cols": ["id_column_3"],
+        "parent_schema": "public", "parent_table": "table4", "parent_cols": ["id_column_1"],
+    },
+]
+
+
+class BulkForeignKeyModeTests(unittest.TestCase):
+    def setUp(self):
+        prepared = prepare(challenge_destinations())
+        self.prepared = prepared
+        self.chunk_destinations = PostgresAdminService._plan_parallel_expansion(prepared)[1]
+
+    def plan(self, info, env="1"):
+        service = PostgresAdminService()
+        with mock.patch.dict(os.environ, {"PDM_EXPANSION_BULK_FK": env}), \
+                mock.patch.object(service, "_run_expansion_json", return_value=info):
+            return service._plan_bulk_fk("db", self.prepared, self.chunk_destinations)
+
+    def test_disabled_unless_opted_in(self):
+        self.assertEqual(self.plan({}, env=""), (None, None))
+
+    def test_refused_without_superuser(self):
+        plan, note = self.plan({"superuser": False, "user_triggers": 0, "foreign_keys": TABLE6_FKS})
+        self.assertIsNone(plan)
+        self.assertIn("superuser", note)
+
+    def test_refused_with_user_triggers(self):
+        plan, note = self.plan({"superuser": True, "user_triggers": 1, "foreign_keys": TABLE6_FKS})
+        self.assertIsNone(plan)
+        self.assertIn("trigger", note)
+
+    def test_parents_outside_chunks_get_share_locked(self):
+        plan, note = self.plan({"superuser": True, "user_triggers": 0, "foreign_keys": TABLE6_FKS})
+        self.assertIsNone(note)
+        self.assertEqual(plan["share_lock_parents"], ['"public"."table4"'])
+        self.assertEqual(len(plan["foreign_keys"]["public.table6"]), 2)
+
+    def test_checked_insert_validates_every_constraint(self):
+        body = PostgresAdminService._checked_insert_body(
+            "INSERT INTO public.table6 (id_column_2, id_column_3) SELECT 1, 2", TABLE6_FKS
+        )
+        self.assertIn('RETURNING "id_column_2", "id_column_3"', body)
+        self.assertEqual(body.count("NOT EXISTS"), 2)
+        self.assertIn("foreign_key_violation", body)
 
 
 if __name__ == "__main__":
