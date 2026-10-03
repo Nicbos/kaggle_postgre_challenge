@@ -17,6 +17,7 @@ from pathlib import Path
 import paramiko
 import pandas as pd
 
+from services.parallel_expansion import ParallelExpansionMixin
 from config import (
     CONTROL_DB,
     CONTROL_SCHEMA,
@@ -67,7 +68,7 @@ class OperationCancelledError(RuntimeError):
     pass
 
 
-class PostgresAdminService:
+class PostgresAdminService(ParallelExpansionMixin):
     VERSION_HISTORY_FORMAT_FULL = "full"
     VERSION_HISTORY_FORMAT_ENTRY = "entry"
     CROSS_TABLE_EXPANSION_OPERATION_KIND = "cross_table_expand_v1"
@@ -13959,6 +13960,19 @@ SELECT json_build_object(
         )
         self._raise_if_cancelled(cancel_event)
 
+        parallel_result = self._try_execute_parallel_cross_table_expansion(
+            database_name,
+            prepared,
+            source_columns,
+            source_versions,
+            timing_report,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            post_commit_callback=post_commit_callback,
+        )
+        if parallel_result is not None:
+            return parallel_result
+
         with self.expansion_timing_scope(
             timing_report,
             "prepare",
@@ -15358,6 +15372,7 @@ DROP TABLE pg_temp.pgdm_expansion_timings;
             100,
             f"{len(registered)} version(s) registered atomically.",
         )
+        self.complete_cross_table_expansion_run(expansion_result)
         return [
             registered_by_table[table_name]
             for table_name in normalized_destinations
