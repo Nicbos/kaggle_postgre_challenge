@@ -47,6 +47,22 @@ Chunks run on N sessions (default `min(nproc, 16)`, override with `PDM_EXPANSION
 ### 4. Finalize and register
 The source hash manifest (the app's existing `raw_hash` manifest) is captured when the run starts and **recomputed at the end**. If the source changed, the run is marked `source_changed` and no version is registered. Otherwise the run becomes `data_committed`. The unchanged `register_cross_table_expansion_versions` then writes the versions, and the run is marked `completed`.
 
+### 5. Optional bulk FK mode (`PDM_EXPANSION_BULK_FK=1`)
+Per-row RI triggers cost about a third of the chunk time: each inserted child row runs its own `SELECT … FOR KEY SHARE` against the parent. In bulk mode a chunk transaction:
+- sets `session_replication_role = replica` (for that transaction only), which switches the RI triggers off;
+- turns every recipe INSERT into `WITH ins AS (<recipe> RETURNING <fk columns>)` and checks each foreign key **once for the whole statement** with a `NOT EXISTS` probe against the parent (MATCH SIMPLE semantics: rows with a NULL key column are skipped). A single violating row raises `foreign_key_violation` and rolls the chunk back;
+- takes `LOCK … IN SHARE MODE` on parents that the chunks never write (`raw_data`, table3, table4), so they cannot change under the check. SHARE is compatible across concurrent chunks.
+
+Parents that are written by the chunks themselves (table1 for table2/5/6) are created in the same transaction, so nobody else can see or delete them before the check runs.
+
+The mode is **opt-in** and refuses to start, falling back to per-row checks with a note in the timing report, when:
+- the role is not a superuser (`session_replication_role` requires one);
+- any user trigger exists on a chunk destination or on the counter table (replica mode would silence it too);
+- a recipe already uses `RETURNING`;
+- a foreign key is not MATCH SIMPLE or is self-referencing.
+
+It was tested positively (identical output at 1M and 5M) and negatively (an INSERT that references a missing parent is rejected with the violating-row count per constraint).
+
 ### State tables (`app_control` schema of the data database, hidden from the table list)
 - `pgdm_expansion_runs`: run key (a hash of source, scope and recipe SQL), status, captured manifest, chunk plan.
 - `pgdm_expansion_chunks`: range, status, rows and server seconds per destination.
@@ -76,22 +92,6 @@ The last row is the deliberate trade-off. Holding `SHARE ROW EXCLUSIVE` across m
 The parallel time scales linearly (1M → 5M ≈ ×3.9 for 5× the rows), so the speed-up is limited by the server's cores: the chunk phase is CPU-bound, and 8 and 12 workers give the same time on this box. On a server with more cores the gain grows proportionally.
 
 Verification: `verify.sql` fingerprints every destination with surrogate ids replaced by natural keys (raw_id and the dimension's natural columns), and checks each `pgdm_table_row_counts` entry against `count(*)`.
-
-### 5. Optional bulk FK mode (`PDM_EXPANSION_BULK_FK=1`)
-Per-row RI triggers cost about a third of the chunk time: each inserted child row runs its own `SELECT … FOR KEY SHARE` against the parent. In bulk mode a chunk transaction:
-- sets `session_replication_role = replica` (for that transaction only), which switches the RI triggers off;
-- turns every recipe INSERT into `WITH ins AS (<recipe> RETURNING <fk columns>)` and checks each foreign key **once for the whole statement** with a `NOT EXISTS` probe against the parent (MATCH SIMPLE semantics: rows with a NULL key column are skipped). A single violating row raises `foreign_key_violation` and rolls the chunk back;
-- takes `LOCK … IN SHARE MODE` on parents that the chunks never write (`raw_data`, table3, table4), so they cannot change under the check. SHARE is compatible across concurrent chunks.
-
-Parents that are written by the chunks themselves (table1 for table2/5/6) are created in the same transaction, so nobody else can see or delete them before the check runs.
-
-The mode is **opt-in** and refuses to start, falling back to per-row checks with a note in the timing report, when:
-- the role is not a superuser (`session_replication_role` requires one);
-- any user trigger exists on a chunk destination or on the counter table (replica mode would silence it too);
-- a recipe already uses `RETURNING`;
-- a foreign key is not MATCH SIMPLE or is self-referencing.
-
-It was tested positively (identical output at 1M and 5M) and negatively (an INSERT that references a missing parent is rejected with the violating-row count per constraint).
 
 ## Not done / next steps
 - **Global DISTINCT recipes** are still single-threaded per recipe (≈5 s per 1M rows for table3). Parallelising them needs splitting the recipe into a parallel SELECT and an INSERT, which would mean rewriting user SQL.
